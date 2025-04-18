@@ -174,6 +174,17 @@ def get_ref_index(mid_neighbor_id, neighbor_ids, length, ref_stride=10, ref_num=
                 ref_index.append(i)
     return ref_index
 
+def video_cutter(frames, threshold=0.3):
+    """Cuts the video into clips based on the threshold.
+    """
+    cuts = []
+    for i in range(1, len(frames)):
+        diff = torch.mean(torch.abs(frames[i] - frames[i-1]), dim=(0,1,2)).item()
+        if diff > threshold:
+            cuts.append(i)
+    return cuts
+
+
 def inference(
         frames, 
         flow_masks, 
@@ -340,6 +351,7 @@ def inference(
                     comp_frames[idx] = comp_frames[idx].astype(np.uint8)
 
             torch.cuda.empty_cache()
+        comp_frames = np.stack(comp_frames, axis=0)
     # ---- LDM inpainting ----
     elif args.mode == 'video_inpainting_vipdiff':
         comp_frames = None
@@ -545,7 +557,18 @@ if __name__ == '__main__':
     ##############################################
     # ProPainter inference
     ##############################################
-    comp_frames = inference(frames, flow_masks, masks_dilated, fix_flow_complete, model, vipdiff_pipe, size, device)
+    comp_frames = None
+    cuts = video_cutter(frames)
+    if len(cuts) == 0:
+        comp_frames = inference(frames, flow_masks, masks_dilated, fix_flow_complete, model, vipdiff_pipe, size, device)
+    else:
+        start = 0
+        cuts.append(video_length)
+        for cut in cuts:
+            comp_frames_sub = inference(frames[:,start:cut], flow_masks[:,start:cut], masks_dilated[:,start:cut], 
+                                        fix_flow_complete[:,start:cut], model, vipdiff_pipe, size, device)
+            comp_frames = comp_frames_sub if comp_frames is None else np.concatenate((comp_frames, comp_frames_sub), axis=0)
+            start = cut
 
     # save each frame
     if args.save_frames:
