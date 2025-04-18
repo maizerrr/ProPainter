@@ -177,12 +177,13 @@ def get_ref_index(mid_neighbor_id, neighbor_ids, length, ref_stride=10, ref_num=
 if __name__ == '__main__':
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device = get_device()
+    print(f"Using device: {device}")
     
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        '-i', '--video', type=str, default='inputs/object_removal/bmx-trees', help='Path of the input video or image folder.')
+        '-i', '--video', type=str, default='inputs/object_removal/video', help='Path of the input video or image folder.')
     parser.add_argument(
-        '-m', '--mask', type=str, default='inputs/object_removal/bmx-trees_mask', help='Path of the mask(s) or mask folder.')
+        '-m', '--mask', type=str, default='inputs/object_removal/video_mask', help='Path of the mask(s) or mask folder.')
     parser.add_argument(
         '-o', '--output', type=str, default='results', help='Output folder. Default: results')
     parser.add_argument(
@@ -202,7 +203,7 @@ if __name__ == '__main__':
     parser.add_argument(
         "--raft_iter", type=int, default=20, help='Iterations for RAFT inference.')
     parser.add_argument(
-        '--mode', default='video_inpainting', choices=['video_inpainting', 'video_outpainting'], help="Modes: video_inpainting / video_outpainting")
+        '--mode', default='video_inpainting', choices=['video_inpainting', 'video_inpainting_vipdiff', 'video_outpainting'], help="Modes: video_inpainting / video_inpainting_vipdiff / video_outpainting")
     parser.add_argument(
         '--scale_h', type=float, default=1.0, help='Outpainting scale of height for video_outpainting mode.')
     parser.add_argument(
@@ -234,7 +235,7 @@ if __name__ == '__main__':
     if not os.path.exists(save_root):
         os.makedirs(save_root, exist_ok=True)
 
-    if args.mode == 'video_inpainting':
+    if args.mode == 'video_inpainting' or args.mode == 'video_inpainting_vipdiff':
         frames_len = len(frames)
         flow_masks, masks_dilated = read_mask(args.mask, frames_len, size, 
                                               flow_mask_dilates=args.mask_dilation,
@@ -311,7 +312,7 @@ if __name__ == '__main__':
         # use fp32 for RAFT
         if frames.size(1) > short_clip_len:
             gt_flows_f_list, gt_flows_b_list = [], []
-            for f in range(0, video_length, short_clip_len):
+            for f in tqdm(range(0, video_length, short_clip_len), desc="Computing ground truth optical flow:"):
                 end_f = min(video_length, f + short_clip_len)
                 if f == 0:
                     flows_f, flows_b = fix_raft(frames[:,f:end_f], iters=args.raft_iter)
@@ -342,7 +343,7 @@ if __name__ == '__main__':
         if flow_length > args.subvideo_length:
             pred_flows_f, pred_flows_b = [], []
             pad_len = 5
-            for f in range(0, flow_length, args.subvideo_length):
+            for f in tqdm(range(0, flow_length, args.subvideo_length), desc="Computing complete optical flow:"):
                 s_f = max(0, f - pad_len)
                 e_f = min(flow_length, f + args.subvideo_length + pad_len)
                 pad_len_s = max(0, f) - s_f
@@ -374,7 +375,7 @@ if __name__ == '__main__':
         if video_length > subvideo_length_img_prop:
             updated_frames, updated_masks = [], []
             pad_len = 10
-            for f in range(0, video_length, subvideo_length_img_prop):
+            for f in tqdm(range(0, video_length, subvideo_length_img_prop), desc="Pixel propagation (pre-processing):"):
                 s_f = max(0, f - pad_len)
                 e_f = min(video_length, f + subvideo_length_img_prop + pad_len)
                 pad_len_s = max(0, f) - s_f
@@ -413,44 +414,48 @@ if __name__ == '__main__':
     else:
         ref_num = -1
     
-    # ---- feature propagation + transformer ----
-    for f in tqdm(range(0, video_length, neighbor_stride)):
-        neighbor_ids = [
-            i for i in range(max(0, f - neighbor_stride),
-                                min(video_length, f + neighbor_stride + 1))
-        ]
-        ref_ids = get_ref_index(f, neighbor_ids, video_length, args.ref_stride, ref_num)
-        selected_imgs = updated_frames[:, neighbor_ids + ref_ids, :, :, :]
-        selected_masks = masks_dilated[:, neighbor_ids + ref_ids, :, :, :]
-        selected_update_masks = updated_masks[:, neighbor_ids + ref_ids, :, :, :]
-        selected_pred_flows_bi = (pred_flows_bi[0][:, neighbor_ids[:-1], :, :, :], pred_flows_bi[1][:, neighbor_ids[:-1], :, :, :])
-        
-        with torch.no_grad():
-            # 1.0 indicates mask
-            l_t = len(neighbor_ids)
+    if args.mode == 'video_inpainting':
+        # ---- feature propagation + transformer ----
+        for f in tqdm(range(0, video_length, neighbor_stride), "Inpainting:"):
+            neighbor_ids = [
+                i for i in range(max(0, f - neighbor_stride),
+                                    min(video_length, f + neighbor_stride + 1))
+            ]
+            ref_ids = get_ref_index(f, neighbor_ids, video_length, args.ref_stride, ref_num)
+            selected_imgs = updated_frames[:, neighbor_ids + ref_ids, :, :, :]
+            selected_masks = masks_dilated[:, neighbor_ids + ref_ids, :, :, :]
+            selected_update_masks = updated_masks[:, neighbor_ids + ref_ids, :, :, :]
+            selected_pred_flows_bi = (pred_flows_bi[0][:, neighbor_ids[:-1], :, :, :], pred_flows_bi[1][:, neighbor_ids[:-1], :, :, :])
             
-            # pred_img = selected_imgs # results of image propagation
-            pred_img = model(selected_imgs, selected_pred_flows_bi, selected_masks, selected_update_masks, l_t)
-            
-            pred_img = pred_img.view(-1, 3, h, w)
-
-            pred_img = (pred_img + 1) / 2
-            pred_img = pred_img.cpu().permute(0, 2, 3, 1).numpy() * 255
-            binary_masks = masks_dilated[0, neighbor_ids, :, :, :].cpu().permute(
-                0, 2, 3, 1).numpy().astype(np.uint8)
-            for i in range(len(neighbor_ids)):
-                idx = neighbor_ids[i]
-                img = np.array(pred_img[i]).astype(np.uint8) * binary_masks[i] \
-                    + ori_frames[idx] * (1 - binary_masks[i])
-                if comp_frames[idx] is None:
-                    comp_frames[idx] = img
-                else: 
-                    comp_frames[idx] = comp_frames[idx].astype(np.float32) * 0.5 + img.astype(np.float32) * 0.5
-                    
-                comp_frames[idx] = comp_frames[idx].astype(np.uint8)
-        
-        torch.cuda.empty_cache()
+            with torch.no_grad():
+                # 1.0 indicates mask
+                l_t = len(neighbor_ids)
                 
+                # pred_img = selected_imgs # results of image propagation
+                pred_img = model(selected_imgs, selected_pred_flows_bi, selected_masks, selected_update_masks, l_t)
+                
+                pred_img = pred_img.view(-1, 3, h, w)
+
+                pred_img = (pred_img + 1) / 2
+                pred_img = pred_img.cpu().permute(0, 2, 3, 1).numpy() * 255
+                binary_masks = masks_dilated[0, neighbor_ids, :, :, :].cpu().permute(
+                    0, 2, 3, 1).numpy().astype(np.uint8)
+                for i in range(len(neighbor_ids)):
+                    idx = neighbor_ids[i]
+                    img = np.array(pred_img[i]).astype(np.uint8) * binary_masks[i] \
+                        + ori_frames[idx] * (1 - binary_masks[i])
+                    if comp_frames[idx] is None:
+                        comp_frames[idx] = img
+                    else: 
+                        comp_frames[idx] = comp_frames[idx].astype(np.float32) * 0.5 + img.astype(np.float32) * 0.5
+                        
+                    comp_frames[idx] = comp_frames[idx].astype(np.uint8)
+            
+            torch.cuda.empty_cache()
+    elif args.mode == 'video_inpainting_vipdiff':
+        # ---- LDM ----
+        raise NotImplementedError
+
     # save each frame
     if args.save_frames:
         for idx in range(video_length):

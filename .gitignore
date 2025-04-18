@@ -1,4 +1,5 @@
 .vscode
+.DS_Store
 
 # ignored files
 version.py
@@ -129,3 +130,5 @@ results/
 *debug*
 *old*
 *.sh
+inputs/
+results/
