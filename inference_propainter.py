@@ -400,6 +400,10 @@ def inference(
         comp_frames = updated_frames.squeeze(0).cpu().permute(0, 2, 3, 1).numpy()
         comp_frames = (comp_frames + 1.0) * 255.0 / 2.0
         comp_frames = comp_frames.astype(np.uint8)
+    else:
+        raise NotImplementedError(f"Mode {args.mode} is not supported.")
+    
+    return comp_frames
 
 if __name__ == '__main__':
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
