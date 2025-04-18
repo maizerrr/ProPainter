@@ -181,11 +181,10 @@ def inference(
         fix_flow_complete, 
         model, 
         vipdiff_pipe, 
+        size,
         device):
-    ##############################################
-    # ProPainter inference
-    ##############################################
     video_length = frames.size(1)
+    w, h = size
     print(f'\nProcessing: {video_name} [{video_length} frames]...')
     with torch.no_grad():
         # ---- compute flow ----
@@ -538,7 +537,11 @@ if __name__ == '__main__':
         vipdiff_pipe.set_progress_bar_config(disable=True)
 
     video_length = frames.size(1)
-    comp_frames = inference(frames, flow_masks, masks_dilated, fix_flow_complete, model, vipdiff_pipe, device)
+
+    ##############################################
+    # ProPainter inference
+    ##############################################
+    comp_frames = inference(frames, flow_masks, masks_dilated, fix_flow_complete, model, vipdiff_pipe, size, device)
 
     # save each frame
     if args.save_frames:
