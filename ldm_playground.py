@@ -34,6 +34,12 @@ def image_inpainting(image, image_mask, device):
     width, height = image.size
     image = image.resize((512,512))
     image_mask = image_mask.resize((512,512))
+
+    image_tensor = torch.from_numpy(np.array(image.resize((512, 512))).astype(np.float32) / 127.5 - 1.0).permute(2, 0, 1)
+    image_tensor = image_tensor.unsqueeze(0)
+    mask_tensor = torch.from_numpy(np.array(mask.resize((512, 512))).astype(np.uint8)/ 255)
+    mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
+    
     pipe = StableDiffusionInpaintPipeline.from_pretrained(
         "stable-diffusion-v1-5/stable-diffusion-inpainting",
         variant="fp16",
@@ -44,7 +50,8 @@ def image_inpainting(image, image_mask, device):
         for param in pipe.parameters():
             param.data = param.data.float()
     prompt = "" # dummy prompt
-    result = pipe(prompt=prompt, image=image, mask_image=image_mask).images[0]
+
+    result = pipe(prompt=prompt, image=image_tensor, mask_image=mask_tensor).images[0]
     return result.resize((width, height))
 
 if __name__ == "__main__":
