@@ -174,144 +174,14 @@ def get_ref_index(mid_neighbor_id, neighbor_ids, length, ref_stride=10, ref_num=
                 ref_index.append(i)
     return ref_index
 
-
-
-if __name__ == '__main__':
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = get_device()
-    print(f"Using device: {device}")
-    
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        '-i', '--video', type=str, default='inputs/object_removal/video', help='Path of the input video or image folder.')
-    parser.add_argument(
-        '-m', '--mask', type=str, default='inputs/object_removal/video_mask', help='Path of the mask(s) or mask folder.')
-    parser.add_argument(
-        '-o', '--output', type=str, default='results', help='Output folder. Default: results')
-    parser.add_argument(
-        "--resize_ratio", type=float, default=1.0, help='Resize scale for processing video.')
-    parser.add_argument(
-        '--height', type=int, default=-1, help='Height of the processing video.')
-    parser.add_argument(
-        '--width', type=int, default=-1, help='Width of the processing video.')
-    parser.add_argument(
-        '--mask_dilation', type=int, default=4, help='Mask dilation for video and flow masking.')
-    parser.add_argument(
-        "--ref_stride", type=int, default=10, help='Stride of global reference frames.')
-    parser.add_argument(
-        "--neighbor_length", type=int, default=10, help='Length of local neighboring frames.')
-    parser.add_argument(
-        "--subvideo_length", type=int, default=80, help='Length of sub-video for long video inference.')
-    parser.add_argument(
-        "--raft_iter", type=int, default=20, help='Iterations for RAFT inference.')
-    parser.add_argument(
-        '--mode', default='video_inpainting', choices=['video_inpainting', 'video_inpainting_vipdiff', 'video_outpainting'], help="Modes: video_inpainting / video_inpainting_vipdiff / video_outpainting")
-    parser.add_argument(
-        '--scale_h', type=float, default=1.0, help='Outpainting scale of height for video_outpainting mode.')
-    parser.add_argument(
-        '--scale_w', type=float, default=1.2, help='Outpainting scale of width for video_outpainting mode.')
-    parser.add_argument(
-        '--save_fps', type=int, default=24, help='Frame per second. Default: 24')
-    parser.add_argument(
-        '--save_frames', action='store_true', help='Save output frames. Default: False')
-    parser.add_argument(
-        '--fp16', action='store_true', help='Use fp16 (half precision) during inference. Default: fp32 (single precision).')
-
-    args = parser.parse_args()
-
-    # Use fp16 precision during inference to reduce running memory cost
-    use_half = True if args.fp16 else False 
-    if device == torch.device('cpu'):
-        use_half = False
-
-    frames, fps, size, video_name = read_frame_from_videos(args.video)
-    if not args.width == -1 and not args.height == -1:
-        size = (args.width, args.height)
-    if not args.resize_ratio == 1.0:
-        size = (int(args.resize_ratio * size[0]), int(args.resize_ratio * size[1]))
-
-    frames, size, out_size = resize_frames(frames, size)
-    
-    fps = args.save_fps if fps is None else fps
-    save_root = os.path.join(args.output, video_name)
-    if not os.path.exists(save_root):
-        os.makedirs(save_root, exist_ok=True)
-
-    if args.mode == 'video_inpainting' or args.mode == 'video_inpainting_vipdiff':
-        frames_len = len(frames)
-        flow_masks, masks_dilated = read_mask(args.mask, frames_len, size, 
-                                              flow_mask_dilates=args.mask_dilation,
-                                              mask_dilates=args.mask_dilation)
-        w, h = size
-    elif args.mode == 'video_outpainting':
-        assert args.scale_h is not None and args.scale_w is not None, 'Please provide a outpainting scale (s_h, s_w).'
-        frames, flow_masks, masks_dilated, size = extrapolation(frames, (args.scale_h, args.scale_w))
-        w, h = size
-    else:
-        raise NotImplementedError
-    
-    # for saving the masked frames or video
-    masked_frame_for_save = []
-    for i in range(len(frames)):
-        mask_ = np.expand_dims(np.array(masks_dilated[i]),2).repeat(3, axis=2)/255.
-        img = np.array(frames[i])
-        green = np.zeros([h, w, 3]) 
-        green[:,:,1] = 255
-        alpha = 0.6
-        # alpha = 1.0
-        fuse_img = (1-alpha)*img + alpha*green
-        fuse_img = mask_ * fuse_img + (1-mask_)*img
-        masked_frame_for_save.append(fuse_img.astype(np.uint8))
-
-    frames_inp = [np.array(f).astype(np.uint8) for f in frames]
-    frames = to_tensors()(frames).unsqueeze(0) * 2 - 1    
-    flow_masks = to_tensors()(flow_masks).unsqueeze(0)
-    masks_dilated = to_tensors()(masks_dilated).unsqueeze(0)
-    frames, flow_masks, masks_dilated = frames.to(device), flow_masks.to(device), masks_dilated.to(device)
-
-    
-    ##############################################
-    # set up RAFT and flow competition model
-    ##############################################
-    ckpt_path = load_file_from_url(url=os.path.join(pretrain_model_url, 'raft-things.pth'), 
-                                    model_dir='weights', progress=True, file_name=None)
-    fix_raft = RAFT_bi(ckpt_path, device)
-    
-    ckpt_path = load_file_from_url(url=os.path.join(pretrain_model_url, 'recurrent_flow_completion.pth'), 
-                                    model_dir='weights', progress=True, file_name=None)
-    fix_flow_complete = RecurrentFlowCompleteNet(ckpt_path)
-    for p in fix_flow_complete.parameters():
-        p.requires_grad = False
-    fix_flow_complete.to(device)
-    fix_flow_complete.eval()
-
-
-    ##############################################
-    # set up ProPainter model
-    ##############################################
-    ckpt_path = load_file_from_url(url=os.path.join(pretrain_model_url, 'ProPainter.pth'), 
-                                    model_dir='weights', progress=True, file_name=None)
-    model = InpaintGenerator(model_path=ckpt_path).to(device)
-    model.eval()
-
-    ##############################################
-    # set up VipDiff pipeline
-    ##############################################
-    vipdiff_pipe = None
-    if args.mode == 'video_inpainting_vipdiff':
-        vipdiff_pipe = StableDiffusionInpaintPipeline.from_pretrained(
-            "stable-diffusion-v1-5/stable-diffusion-inpainting",
-            variant="fp16",
-            torch_dtype=torch.float16
-        )
-        if device == "cpu":
-            # cpu can only use fp32
-            for param in vipdiff_pipe.parameters():
-                param.data = param.data.float()
-        vipdiff_pipe = vipdiff_pipe.to(device)
-        vipdiff_pipe.set_progress_bar_config(disable=True)
-
-    
+def inference(
+        frames, 
+        flow_masks, 
+        masks_dilated, 
+        fix_flow_complete, 
+        model, 
+        vipdiff_pipe, 
+        device):
     ##############################################
     # ProPainter inference
     ##############################################
@@ -526,6 +396,149 @@ if __name__ == '__main__':
             inpainted_frames = (inpainted_frames + 1.0) * 255.0 / 2.0
             inpainted_frames = inpainted_frames.astype(np.uint8)
             comp_frames = np.concatenate((comp_frames, inpainted_frames), axis=0) if comp_frames is not None else inpainted_frames
+    # ---- preview propagation result ----
+    elif args.mode == 'video_propagation':
+        comp_frames = updated_frames.squeeze(0).cpu().permute(0, 2, 3, 1).numpy()
+        comp_frames = (comp_frames + 1.0) * 255.0 / 2.0
+        comp_frames = comp_frames.astype(np.uint8)
+
+if __name__ == '__main__':
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()
+    print(f"Using device: {device}")
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '-i', '--video', type=str, default='inputs/object_removal/video', help='Path of the input video or image folder.')
+    parser.add_argument(
+        '-m', '--mask', type=str, default='inputs/object_removal/video_mask', help='Path of the mask(s) or mask folder.')
+    parser.add_argument(
+        '-o', '--output', type=str, default='results', help='Output folder. Default: results')
+    parser.add_argument(
+        "--resize_ratio", type=float, default=1.0, help='Resize scale for processing video.')
+    parser.add_argument(
+        '--height', type=int, default=-1, help='Height of the processing video.')
+    parser.add_argument(
+        '--width', type=int, default=-1, help='Width of the processing video.')
+    parser.add_argument(
+        '--mask_dilation', type=int, default=4, help='Mask dilation for video and flow masking.')
+    parser.add_argument(
+        "--ref_stride", type=int, default=10, help='Stride of global reference frames.')
+    parser.add_argument(
+        "--neighbor_length", type=int, default=10, help='Length of local neighboring frames.')
+    parser.add_argument(
+        "--subvideo_length", type=int, default=80, help='Length of sub-video for long video inference.')
+    parser.add_argument(
+        "--raft_iter", type=int, default=20, help='Iterations for RAFT inference.')
+    parser.add_argument(
+        '--mode', default='video_inpainting', choices=['video_inpainting', 'video_inpainting_vipdiff', 'video_propagation', 'video_outpainting'], help="Modes: video_inpainting / video_inpainting_vipdiff / video_propagation / video_outpainting")
+    parser.add_argument(
+        '--scale_h', type=float, default=1.0, help='Outpainting scale of height for video_outpainting mode.')
+    parser.add_argument(
+        '--scale_w', type=float, default=1.2, help='Outpainting scale of width for video_outpainting mode.')
+    parser.add_argument(
+        '--save_fps', type=int, default=24, help='Frame per second. Default: 24')
+    parser.add_argument(
+        '--save_frames', action='store_true', help='Save output frames. Default: False')
+    parser.add_argument(
+        '--fp16', action='store_true', help='Use fp16 (half precision) during inference. Default: fp32 (single precision).')
+
+    args = parser.parse_args()
+
+    # Use fp16 precision during inference to reduce running memory cost
+    use_half = True if args.fp16 else False 
+    if device == torch.device('cpu'):
+        use_half = False
+
+    frames, fps, size, video_name = read_frame_from_videos(args.video)
+    if not args.width == -1 and not args.height == -1:
+        size = (args.width, args.height)
+    if not args.resize_ratio == 1.0:
+        size = (int(args.resize_ratio * size[0]), int(args.resize_ratio * size[1]))
+
+    frames, size, out_size = resize_frames(frames, size)
+    
+    fps = args.save_fps if fps is None else fps
+    save_root = os.path.join(args.output, video_name)
+    if not os.path.exists(save_root):
+        os.makedirs(save_root, exist_ok=True)
+
+    if args.mode == 'video_inpainting' or args.mode == 'video_inpainting_vipdiff' or args.mode == 'video_propagation':
+        frames_len = len(frames)
+        flow_masks, masks_dilated = read_mask(args.mask, frames_len, size, 
+                                              flow_mask_dilates=args.mask_dilation,
+                                              mask_dilates=args.mask_dilation)
+        w, h = size
+    elif args.mode == 'video_outpainting':
+        assert args.scale_h is not None and args.scale_w is not None, 'Please provide a outpainting scale (s_h, s_w).'
+        frames, flow_masks, masks_dilated, size = extrapolation(frames, (args.scale_h, args.scale_w))
+        w, h = size
+    else:
+        raise NotImplementedError
+    
+    # for saving the masked frames or video
+    masked_frame_for_save = []
+    for i in range(len(frames)):
+        mask_ = np.expand_dims(np.array(masks_dilated[i]),2).repeat(3, axis=2)/255.
+        img = np.array(frames[i])
+        green = np.zeros([h, w, 3]) 
+        green[:,:,1] = 255
+        alpha = 0.6
+        # alpha = 1.0
+        fuse_img = (1-alpha)*img + alpha*green
+        fuse_img = mask_ * fuse_img + (1-mask_)*img
+        masked_frame_for_save.append(fuse_img.astype(np.uint8))
+
+    frames_inp = [np.array(f).astype(np.uint8) for f in frames]
+    frames = to_tensors()(frames).unsqueeze(0) * 2 - 1    
+    flow_masks = to_tensors()(flow_masks).unsqueeze(0)
+    masks_dilated = to_tensors()(masks_dilated).unsqueeze(0)
+    frames, flow_masks, masks_dilated = frames.to(device), flow_masks.to(device), masks_dilated.to(device)
+
+    
+    ##############################################
+    # set up RAFT and flow competition model
+    ##############################################
+    ckpt_path = load_file_from_url(url=os.path.join(pretrain_model_url, 'raft-things.pth'), 
+                                    model_dir='weights', progress=True, file_name=None)
+    fix_raft = RAFT_bi(ckpt_path, device)
+    
+    ckpt_path = load_file_from_url(url=os.path.join(pretrain_model_url, 'recurrent_flow_completion.pth'), 
+                                    model_dir='weights', progress=True, file_name=None)
+    fix_flow_complete = RecurrentFlowCompleteNet(ckpt_path)
+    for p in fix_flow_complete.parameters():
+        p.requires_grad = False
+    fix_flow_complete.to(device)
+    fix_flow_complete.eval()
+
+
+    ##############################################
+    # set up ProPainter model
+    ##############################################
+    ckpt_path = load_file_from_url(url=os.path.join(pretrain_model_url, 'ProPainter.pth'), 
+                                    model_dir='weights', progress=True, file_name=None)
+    model = InpaintGenerator(model_path=ckpt_path).to(device)
+    model.eval()
+
+    ##############################################
+    # set up VipDiff pipeline
+    ##############################################
+    vipdiff_pipe = None
+    if args.mode == 'video_inpainting_vipdiff':
+        vipdiff_pipe = StableDiffusionInpaintPipeline.from_pretrained(
+            "stable-diffusion-v1-5/stable-diffusion-inpainting",
+            variant="fp16",
+            torch_dtype=torch.float16
+        )
+        if device == "cpu":
+            # cpu can only use fp32
+            for param in vipdiff_pipe.parameters():
+                param.data = param.data.float()
+        vipdiff_pipe = vipdiff_pipe.to(device)
+        vipdiff_pipe.set_progress_bar_config(disable=True)
+
+    video_length = frames.size(1)
+    comp_frames = inference(frames, flow_masks, masks_dilated, fix_flow_complete, model, vipdiff_pipe, device)
 
     # save each frame
     if args.save_frames:
