@@ -309,6 +309,7 @@ if __name__ == '__main__':
             for param in vipdiff_pipe.parameters():
                 param.data = param.data.float()
         vipdiff_pipe = vipdiff_pipe.to(device)
+        vipdiff_pipe.set_progress_bar_config(disable=True)
 
     
     ##############################################
@@ -472,7 +473,7 @@ if __name__ == '__main__':
             torch.cuda.empty_cache()
     # ---- LDM inpainting ----
     elif args.mode == 'video_inpainting_vipdiff':
-        comp_frames = []
+        comp_frames = None
         b, t, _, h, w = updated_frames.size()
         if b != 1:
             print(f"Warning! VipDiff does not support batch inference, will process {b} batches one by one.")
@@ -492,8 +493,13 @@ if __name__ == '__main__':
                     # 1. inpaint first frame with LDM
                     to_inpaint_frame = to_inpaint_frames[f]
                     inpaint_prompt = "" # dummy prompt
-                    pred_img = vipdiff_pipe(prompt=inpaint_prompt, image=to_inpaint_frame, mask_image=to_inpaint_mask).images[0]
-                    pred_img = torch.from_numpy(np.array(pred_img)).permute(2, 0, 1).unsqueeze(0).to(device)
+                    pred_img = vipdiff_pipe(
+                        prompt=inpaint_prompt, 
+                        image=to_inpaint_frame, 
+                        mask_image=to_inpaint_mask, 
+                        height=h, width=w
+                    ).images[0]
+                    pred_img = torch.from_numpy(np.array(pred_img).astype(np.float32) / 127.5 - 1.0).permute(2, 0, 1).unsqueeze(0).to(device)
                     to_inpaint_frames[f] = pred_img
                     to_inpaint_masks[f] = torch.zeros_like(to_inpaint_mask).to(device)
                     torch.cuda.empty_cache()
@@ -504,21 +510,22 @@ if __name__ == '__main__':
                         pad_len_s = max(0, _f) - s_f
                         pad_len_e = e_f - min(video_length, _f + subvideo_length_img_prop)
                         pred_flows_bi_sub = (pred_flows_bi[0][:, s_f:e_f-1], pred_flows_bi[1][:, s_f:e_f-1])
-                        to_prop_frame_tensor = torch.cat(to_inpaint_frames[s_f:e_f], dim=1).to(device)
-                        to_prop_mask_tensor = torch.cat(to_inpaint_masks[s_f:e_f], dim=1).to(device)
+                        to_prop_frame_tensor = torch.stack(to_inpaint_frames[s_f:e_f], dim=1).to(device)
+                        to_prop_mask_tensor = torch.stack(to_inpaint_masks[s_f:e_f], dim=1).to(device)
                         prop_imgs_sub, updated_local_masks_sub = model.img_propagation(to_prop_frame_tensor, 
                                                                         pred_flows_bi_sub, 
                                                                         to_prop_mask_tensor, 
                                                                         'nearest')
-                        updated_frames_sub = prop_imgs_sub.view(b, t, 3, h, w) * to_prop_mask_tensor + to_prop_frame_tensor * (1 - to_prop_mask_tensor)
-                        updated_masks_sub = updated_local_masks_sub.view(b, t, 1, h, w)
+                        updated_frames_sub = prop_imgs_sub.view(b, -1, 3, h, w) * to_prop_mask_tensor + to_prop_frame_tensor * (1 - to_prop_mask_tensor)
+                        updated_masks_sub = updated_local_masks_sub.view(b, -1, 1, h, w)
                         to_inpaint_frames[_f:e_f-pad_len_e] = updated_frames_sub[:, pad_len_s:e_f-s_f-pad_len_e].unbind(dim=1)
                         to_inpaint_masks[_f:e_f-pad_len_e] = updated_masks_sub[:, pad_len_s:e_f-s_f-pad_len_e].unbind(dim=1)
                         torch.cuda.empty_cache()
                 pbar.update(1)
-            inpainted_frames = torch.cat(to_inpaint_frames, dim=1).squeeze(0).cpu().permute(0, 2, 3, 1).numpy()
+            inpainted_frames = torch.stack(to_inpaint_frames, dim=1).squeeze(0).cpu().permute(0, 2, 3, 1).numpy()
             inpainted_frames = (inpainted_frames + 1.0) * 255.0 / 2.0
-            comp_frames.append(inpainted_frames.astype(np.uint8))
+            inpainted_frames = inpainted_frames.astype(np.uint8)
+            comp_frames = np.concatenate((comp_frames, inpainted_frames), axis=0) if comp_frames is not None else inpainted_frames
 
     # save each frame
     if args.save_frames:
