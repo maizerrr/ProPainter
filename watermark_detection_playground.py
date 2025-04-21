@@ -1,10 +1,21 @@
 import cv2
 import numpy as np
-import tqdm
+from tqdm import tqdm
+import torch
 from shapely.geometry import Polygon
+from torch.autograd import Variable
+
+from model.craft import CRAFT, resize_aspect_ratio, normalizeMeanVariance, getDetBoxes, adjustResultCoordinates, copyStateDict
+from model.misc import get_device
+
+device = get_device()
+print(f"Using device: {device}")
 
 # Load the pre-trained EAST text detection model
-net = cv2.dnn.readNet("weights/frozen_east_text_detection.pb")
+net = CRAFT()
+net.load_state_dict(copyStateDict(torch.load("weights/craft_mlt_25k.pth", map_location=device)))  # Use device for loading weights
+net.to(device)  # Move model to the appropriate device
+net.eval()
 
 # Open the video file
 cap = cv2.VideoCapture("/Users/temptrip/Movies/sample_video_1_480p.mp4")  # Replace with your video file path
@@ -81,50 +92,62 @@ def are_similar(region1, region2):
 
 # Updated video processing loop
 frame_regions = {}
+processed_frames = []
 frame_no = 0
 
 while True:
     ret, frame = cap.read()
     if not ret:
         break
+    processed_frames.append(frame)
+cap.release()
 
+for frame in tqdm(processed_frames, desc="Processing frames", unit="frame"):
     frame_no += 1
-    (H, W) = frame.shape[:2]
-    newW, newH = 320, 320
-    rW = W / float(newW)
-    rH = H / float(newH)
-    frame_resized = cv2.resize(frame, (newW, newH))
+    frame_resized, target_ratio, size_heatmap = resize_aspect_ratio(frame, 1280, interpolation=cv2.INTER_LINEAR, mag_ratio=1)
+    ratio_h = ratio_w = 1 / target_ratio
 
-    blob = cv2.dnn.blobFromImage(frame_resized, 1.0, (newW, newH), (123.68, 116.78, 103.94), swapRB=True, crop=False)
-    net.setInput(blob)
+    # preprocessing
+    x = normalizeMeanVariance(frame_resized)
+    x = torch.from_numpy(x).permute(2, 0, 1)    # [h, w, c] to [c, h, w]
+    x = Variable(x.unsqueeze(0).to(device))     # Move tensor to the appropriate device
 
-    (scores, geometry) = net.forward(["feature_fusion/Conv_7/Sigmoid", "feature_fusion/concat_3"])
+    with torch.no_grad():
+        # Forward pass
+        y, feature = net(x)
 
-    (rects, confidences) = decode_predictions(scores, geometry)
-    indices = cv2.dnn.NMSBoxes(rects, confidences, 0.5, 0.4)
+    # make score and link map
+    score_text = y[0,:,:,0].cpu().data.numpy()  # Move back to CPU for further processing
+    score_link = y[0,:,:,1].cpu().data.numpy()
 
-    if len(indices) > 0:
+    # Post-processing
+    boxes, polys = getDetBoxes(score_text, score_link, text_threshold=0.7, link_threshold=0.4, low_text=0.4, poly=False)
+    boxes = adjustResultCoordinates(boxes, ratio_w, ratio_h)
+    polys = adjustResultCoordinates(polys, ratio_w, ratio_h)
+    for k in range(len(polys)):
+        if polys[k] is None: polys[k] = boxes[k]
+
+    if len(boxes) > 0:
         frame_regions[frame_no] = []
-        for i in indices.flatten():
-            (x, y, w, h) = rects[i]
-            x = int(x * rW)
-            y = int(y * rH)
-            w = int(w * rW)
-            h = int(h * rH)
-            frame_regions[frame_no].append((x, x + w, y, y + h))
-
-    # Display the result
-    for region in frame_regions.get(frame_no, []):
-        (x1, x2, y1, y2) = region
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-    cv2.imshow("Frame", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+        for box in boxes:
+            # Extract top-left and bottom-right coordinates
+            x1, y1 = np.min(box, axis=0)  # Top-left corner
+            x2, y2 = np.max(box, axis=0)  # Bottom-right corner
+            frame_regions[frame_no].append((x1, y1, x2, y2))
 
 # Unify regions across frames
 unified_regions = unify_regions(frame_regions)
 
+# Replay the video with post-processed results
+for frame_no, frame in enumerate(processed_frames, start=1):
+    if frame_no in unified_regions:
+        for region in unified_regions[frame_no]:
+            (x1, y1, x2, y2) = region
+            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+
+    cv2.imshow("Processed Video", frame)
+    if cv2.waitKey(30) & 0xFF == ord('q'):  # Adjust delay as needed for playback speed
+        break
+
 # Release resources
-cap.release()
 cv2.destroyAllWindows()
