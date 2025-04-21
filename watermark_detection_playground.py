@@ -21,7 +21,7 @@ net.eval()
 cap = cv2.VideoCapture("/Users/temptrip/Movies/sample_video_1_480p.mp4")  # Replace with your video file path
 
 # Helper function to unify text regions across frames
-def unify_regions(raw_regions):
+def unify_text_regions(raw_regions):
     keys = sorted(raw_regions.keys())
     unified_regions = {}
     last_key = keys[0]
@@ -134,7 +134,8 @@ def detect_static_regions(processed_frames, threshold=100, min_bbox_size=(5, 5),
 
 def merge_bounding_boxes(boxes):
     """
-    Merges overlapping bounding boxes into non-overlapping ones.
+    Merges overlapping bounding boxes into non-overlapping ones and removes boxes
+    that are completely contained within larger boxes.
 
     Args:
         boxes (list): List of bounding boxes [(x1, y1, x2, y2)].
@@ -145,32 +146,104 @@ def merge_bounding_boxes(boxes):
     if not boxes:
         return []
 
-    # Sort boxes by the x1 coordinate
-    boxes = sorted(boxes, key=lambda b: b[0])
+    # Sort boxes by their top-left corner (x1, y1)
+    boxes = sorted(boxes, key=lambda b: (b[0], b[1]))
 
     merged_boxes = []
-    current_box = boxes[0]
-
-    for box in boxes[1:]:
+    while boxes:
+        # Take the first box and compare it with the rest
+        current_box = boxes.pop(0)
         x1, y1, x2, y2 = current_box
-        bx1, by1, bx2, by2 = box
 
-        # Check if the current box overlaps with the next box
-        if bx1 <= x2 and by1 <= y2 and bx2 >= x1 and by2 >= y1:
-            # Merge the boxes
-            current_box = (min(x1, bx1), min(y1, by1), max(x2, bx2), max(y2, by2))
-        else:
-            # No overlap, add the current box to the result
-            merged_boxes.append(current_box)
-            current_box = box
+        # Check for overlaps with the remaining boxes
+        i = 0
+        while i < len(boxes):
+            bx1, by1, bx2, by2 = boxes[i]
 
-    # Add the last box
-    merged_boxes.append(current_box)
+            # Check if the current box overlaps with this box
+            if bx1 <= x2 and bx2 >= x1 and by1 <= y2 and by2 >= y1:
+                # Merge the boxes
+                x1 = min(x1, bx1)
+                y1 = min(y1, by1)
+                x2 = max(x2, bx2)
+                y2 = max(y2, by2)
 
-    return merged_boxes
+                # Remove the merged box from the list
+                boxes.pop(i)
+            else:
+                # No overlap, move to the next box
+                i += 1
+
+        # Add the merged box to the result
+        merged_boxes.append((x1, y1, x2, y2))
+
+    # Remove boxes that are completely contained within others
+    final_boxes = []
+    for box in merged_boxes:
+        x1, y1, x2, y2 = box
+        is_contained = False
+        for other_box in merged_boxes:
+            if box == other_box:
+                continue
+            ox1, oy1, ox2, oy2 = other_box
+            # Check if the current box is completely inside another box
+            if x1 >= ox1 and y1 >= oy1 and x2 <= ox2 and y2 <= oy2:
+                is_contained = True
+                break
+        if not is_contained:
+            final_boxes.append(box)
+
+    return final_boxes
+
+def post_process_regions(static_regions, text_regions, bbox_expand=0):
+    """
+    Combines static region and text detection bounding boxes, applies optional expansion, 
+    and merges overlapping bounding boxes.
+
+    Args:
+        static_regions (dict): Bounding boxes from static region detection. 
+                               Format: {frame_no: [(x1, y1, x2, y2), ...]}.
+        text_regions (dict): Bounding boxes from text detection. 
+                             Format: {frame_no: [(x1, y1, x2, y2), ...]}.
+        bbox_expand (int): Number of pixels to expand each bounding box on all sides.
+
+    Returns:
+        dict: Combined and processed bounding boxes for each frame.
+              Format: {frame_no: [(x1, y1, x2, y2), ...]}.
+    """
+    combined_regions = {}
+
+    for frame_no in range(1, max(len(static_regions), len(text_regions)) + 1):
+        # Get bounding boxes from static regions and text regions
+        static_boxes = static_regions.get(frame_no, [])
+        text_boxes = text_regions.get(frame_no, [])
+        
+        # Combine both sets of bounding boxes
+        all_boxes = static_boxes + text_boxes
+
+        # Expand bounding boxes if bbox_expand > 0
+        if bbox_expand > 0:
+            expanded_boxes = []
+            for box in all_boxes:
+                x1, y1, x2, y2 = box
+                expanded_boxes.append((
+                    max(0, x1 - bbox_expand),  # Ensure x1 doesn't go below 0
+                    max(0, y1 - bbox_expand),  # Ensure y1 doesn't go below 0
+                    x2 + bbox_expand,
+                    y2 + bbox_expand
+                ))
+            all_boxes = expanded_boxes
+
+        # Merge overlapping bounding boxes
+        merged_boxes = merge_bounding_boxes(all_boxes)
+
+        # Store the merged boxes for the current frame
+        combined_regions[frame_no] = merged_boxes
+
+    return combined_regions
 
 # Updated video processing loop
-frame_regions = {}
+text_regions = {}
 processed_frames = []
 frame_no = 0
 
@@ -210,21 +283,23 @@ for frame in tqdm(processed_frames, desc="Processing frames", unit="frame"):
         if polys[k] is None: polys[k] = boxes[k]
 
     if len(boxes) > 0:
-        frame_regions[frame_no] = []
+        text_regions[frame_no] = []
         for box in boxes:
             # Extract top-left and bottom-right coordinates
             x1, y1 = np.min(box, axis=0)  # Top-left corner
             x2, y2 = np.max(box, axis=0)  # Bottom-right corner
-            frame_regions[frame_no].append((x1, y1, x2, y2))
+            text_regions[frame_no].append((x1, y1, x2, y2))
 
 # Unify regions across frames
-unified_regions = unify_regions(frame_regions)
+text_regions = unify_text_regions(text_regions)
+
+# Combine and post-process regions
+combined_regions = post_process_regions(static_regions, text_regions)
 
 # Replay the video with post-processed results
 for frame_no, frame in enumerate(processed_frames, start=1):
-    if frame_no in static_regions:
-        for region in static_regions[frame_no]:
-        # for region in unified_regions[frame_no]:
+    if frame_no in combined_regions:
+        for region in combined_regions[frame_no]:
             (x1, y1, x2, y2) = region
             cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
 
