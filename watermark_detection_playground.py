@@ -20,42 +20,6 @@ net.eval()
 # Open the video file
 cap = cv2.VideoCapture("/Users/temptrip/Movies/sample_video_1_480p.mp4")  # Replace with your video file path
 
-# Helper function to decode predictions
-def decode_predictions(scores, geometry, conf_threshold=0.5):
-    (numRows, numCols) = scores.shape[2:4]
-    rects = []
-    confidences = []
-
-    for y in range(0, numRows):
-        scoresData = scores[0, 0, y]
-        xData0 = geometry[0, 0, y]
-        xData1 = geometry[0, 1, y]
-        xData2 = geometry[0, 2, y]
-        xData3 = geometry[0, 3, y]
-        anglesData = geometry[0, 4, y]
-
-        for x in range(0, numCols):
-            if scoresData[x] < conf_threshold:
-                continue
-
-            (offsetX, offsetY) = (x * 4.0, y * 4.0)
-            angle = anglesData[x]
-            cos = np.cos(angle)
-            sin = np.sin(angle)
-
-            h = xData0[x] + xData2[x]
-            w = xData1[x] + xData3[x]
-
-            endX = int(offsetX + (cos * xData1[x]) + (sin * xData2[x]))
-            endY = int(offsetY - (sin * xData1[x]) + (cos * xData2[x]))
-            startX = int(endX - w)
-            startY = int(endY - h)
-
-            rects.append((startX, startY, w, h))
-            confidences.append(float(scoresData[x]))
-
-    return (rects, confidences)
-
 # Helper function to unify text regions across frames
 def unify_regions(raw_regions):
     keys = sorted(raw_regions.keys())
@@ -90,6 +54,121 @@ def are_similar(region1, region2):
     return abs(xmin1 - xmin2) <= 10 and abs(xmax1 - xmax2) <= 10 and \
            abs(ymin1 - ymin2) <= 10 and abs(ymax1 - ymax2) <= 10
 
+def detect_static_regions(processed_frames, threshold=100, min_bbox_size=(5, 5), neighbor_threshold=20):
+    """
+    Detects static regions (e.g., watermark) across all frames and wraps them with non-overlapping bounding boxes.
+
+    Args:
+        processed_frames (list): List of frames (color).
+        threshold (int): Variance threshold to identify static regions.
+        min_bbox_size (tuple): Minimum width and height of a bounding box (width, height).
+        neighbor_threshold (int): Maximum distance to consider two bounding boxes as neighbors.
+
+    Returns:
+        dict: A dictionary where keys are frame numbers and values are lists of non-overlapping bounding boxes
+              [(x1, y1, x2, y2)] for detected static regions.
+    """
+    # Split frames into color channels (R, G, B)
+    channels = [np.stack([frame[:, :, c] for frame in processed_frames], axis=0) for c in range(3)]  # Shape: (num_frames, height, width)
+
+    # Calculate pixel-wise variance for each channel
+    variance_maps = [np.var(channel_stack, axis=0) for channel_stack in channels]
+
+    # Combine variance maps (e.g., take the maximum variance across channels)
+    combined_variance_map = np.max(variance_maps, axis=0)
+
+    # Threshold the combined variance map to find static regions
+    static_region = (combined_variance_map < threshold).astype(np.uint8)  # Binary mask of static regions
+
+    # Find contours of the static region
+    contours, _ = cv2.findContours(static_region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Prepare the output in the format of frame_regions
+    static_regions = {}
+    bounding_boxes = []
+
+    if contours:
+        # Extract bounding boxes for all contours
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            bounding_boxes.append((x, y, x + w, y + h))  # Store as (x1, y1, x2, y2)
+
+        # Filter small bounding boxes only if they have no neighbors
+        filtered_boxes = []
+        for box in bounding_boxes:
+            x1, y1, x2, y2 = box
+            width, height = x2 - x1, y2 - y1
+
+            if width >= min_bbox_size[0] and height >= min_bbox_size[1]:
+                # Large enough, keep it
+                filtered_boxes.append(box)
+            else:
+                # Check for neighbors that meet the minimum size requirement
+                has_valid_neighbor = False
+                for other_box in bounding_boxes:
+                    if box == other_box:
+                        continue
+                    ox1, oy1, ox2, oy2 = other_box
+                    o_width, o_height = ox2 - ox1, oy2 - oy1
+
+                    # Only consider neighbors that meet the minimum size requirement
+                    if o_width >= min_bbox_size[0] and o_height >= min_bbox_size[1]:
+                        # Check if the boxes are within the neighbor threshold
+                        if abs(x1 - ox2) <= neighbor_threshold or abs(x2 - ox1) <= neighbor_threshold:
+                            if abs(y1 - oy2) <= neighbor_threshold or abs(y2 - oy1) <= neighbor_threshold:
+                                has_valid_neighbor = True
+                                break
+
+                if has_valid_neighbor:
+                    filtered_boxes.append(box)
+
+        # Merge overlapping bounding boxes
+        merged_boxes = merge_bounding_boxes(filtered_boxes)
+
+        # Add the merged bounding boxes for all frames
+        for frame_no in range(1, len(processed_frames) + 1):
+            static_regions[frame_no] = merged_boxes
+
+    return static_regions
+
+
+def merge_bounding_boxes(boxes):
+    """
+    Merges overlapping bounding boxes into non-overlapping ones.
+
+    Args:
+        boxes (list): List of bounding boxes [(x1, y1, x2, y2)].
+
+    Returns:
+        list: List of merged non-overlapping bounding boxes [(x1, y1, x2, y2)].
+    """
+    if not boxes:
+        return []
+
+    # Sort boxes by the x1 coordinate
+    boxes = sorted(boxes, key=lambda b: b[0])
+
+    merged_boxes = []
+    current_box = boxes[0]
+
+    for box in boxes[1:]:
+        x1, y1, x2, y2 = current_box
+        bx1, by1, bx2, by2 = box
+
+        # Check if the current box overlaps with the next box
+        if bx1 <= x2 and by1 <= y2 and bx2 >= x1 and by2 >= y1:
+            # Merge the boxes
+            current_box = (min(x1, bx1), min(y1, by1), max(x2, bx2), max(y2, by2))
+        else:
+            # No overlap, add the current box to the result
+            merged_boxes.append(current_box)
+            current_box = box
+
+    # Add the last box
+    merged_boxes.append(current_box)
+
+    return merged_boxes
+
 # Updated video processing loop
 frame_regions = {}
 processed_frames = []
@@ -101,6 +180,9 @@ while True:
         break
     processed_frames.append(frame)
 cap.release()
+
+# Detect static regions (e.g., watermark) across all frames
+static_regions = detect_static_regions(processed_frames, threshold=200)
 
 for frame in tqdm(processed_frames, desc="Processing frames", unit="frame"):
     frame_no += 1
@@ -140,8 +222,9 @@ unified_regions = unify_regions(frame_regions)
 
 # Replay the video with post-processed results
 for frame_no, frame in enumerate(processed_frames, start=1):
-    if frame_no in unified_regions:
-        for region in unified_regions[frame_no]:
+    if frame_no in static_regions:
+        for region in static_regions[frame_no]:
+        # for region in unified_regions[frame_no]:
             (x1, y1, x2, y2) = region
             cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
 
