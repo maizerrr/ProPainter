@@ -178,8 +178,8 @@ def video_cutter(frames, threshold=0.3):
     """Cuts the video into clips based on the threshold.
     """
     cuts = []
-    for i in range(1, len(frames)):
-        diff = torch.mean(torch.abs(frames[i] - frames[i-1]), dim=(0,1,2)).item()
+    for i in range(1, frames.size(1)):
+        diff = torch.mean(torch.abs(frames[:,i] - frames[:,i-1]), dim=(0,1,2,3)).item()
         if diff > threshold:
             cuts.append(i)
     return cuts
@@ -200,13 +200,13 @@ def inference(
     with torch.no_grad():
         # ---- compute flow ----
         if frames.size(-1) <= 640: 
-            short_clip_len = 12
+            short_clip_len = 120
         elif frames.size(-1) <= 720: 
-            short_clip_len = 8
+            short_clip_len = 80
         elif frames.size(-1) <= 1280:
-            short_clip_len = 4
+            short_clip_len = 40
         else:
-            short_clip_len = 2
+            short_clip_len = 20
         
         # use fp32 for RAFT
         if frames.size(1) > short_clip_len:
@@ -332,11 +332,10 @@ def inference(
                 
                 # pred_img = selected_imgs # results of image propagation
                 pred_img = model(selected_imgs, selected_pred_flows_bi, selected_masks, selected_update_masks, l_t)
-                
                 pred_img = pred_img.view(-1, 3, h, w)
-
                 pred_img = (pred_img + 1) / 2
                 pred_img = pred_img.cpu().permute(0, 2, 3, 1).numpy() * 255
+                
                 binary_masks = masks_dilated[0, neighbor_ids, :, :, :].cpu().permute(
                     0, 2, 3, 1).numpy().astype(np.uint8)
                 for i in range(len(neighbor_ids)):
@@ -373,34 +372,59 @@ def inference(
                 with torch.no_grad():
                     # 1. inpaint first frame with LDM
                     to_inpaint_frame = to_inpaint_frames[f]
-                    inpaint_prompt = "" # dummy prompt
-                    pred_img = vipdiff_pipe(
-                        prompt=inpaint_prompt, 
-                        image=to_inpaint_frame, 
-                        mask_image=to_inpaint_mask, 
-                        height=h, width=w
-                    ).images[0]
+                    # inpaint_prompt = "" # dummy prompt
+                    # pred_img = vipdiff_pipe(
+                    #     prompt=inpaint_prompt, 
+                    #     image=to_inpaint_frame, 
+                    #     mask_image=to_inpaint_mask, 
+                    #     height=h, width=w
+                    # ).images[0]
+
+                    # pred with cv2
+                    to_inpaint_frame_np = to_inpaint_frame.squeeze(0).permute(1, 2, 0).cpu().numpy()  # Shape: (H, W, 3)
+                    to_inpaint_mask_np = to_inpaint_mask.squeeze(0).squeeze(0).cpu().numpy()          # Shape: (H, W)
+                    to_inpaint_frame_np = ((to_inpaint_frame_np + 1.0) * 127.5).astype(np.uint8)
+                    to_inpaint_mask_np = ((to_inpaint_mask_np > 0).astype(np.uint8) * 255)
+                    pred_img = cv2.inpaint(to_inpaint_frame_np, to_inpaint_mask_np, 3, cv2.INPAINT_TELEA)
+                    
                     pred_img = torch.from_numpy(np.array(pred_img).astype(np.float32) / 127.5 - 1.0).permute(2, 0, 1).unsqueeze(0).to(device)
                     to_inpaint_frames[f] = pred_img
                     to_inpaint_masks[f] = torch.zeros_like(to_inpaint_mask).to(device)
                     torch.cuda.empty_cache()
                     # 2. update following frames with pixel propagation
-                    for _f in range(f + 1, video_length, subvideo_length_img_prop):
-                        s_f = max(0, _f - pad_len)
-                        e_f = min(video_length, _f + subvideo_length_img_prop + pad_len)
-                        pad_len_s = max(0, _f) - s_f
-                        pad_len_e = e_f - min(video_length, _f + subvideo_length_img_prop)
-                        pred_flows_bi_sub = (pred_flows_bi[0][:, s_f:e_f-1], pred_flows_bi[1][:, s_f:e_f-1])
-                        to_prop_frame_tensor = torch.stack(to_inpaint_frames[s_f:e_f], dim=1).to(device)
-                        to_prop_mask_tensor = torch.stack(to_inpaint_masks[s_f:e_f], dim=1).to(device)
+                    if f == video_length - 1:
+                        pbar.update(1)
+                        continue
+                    elif video_length > subvideo_length_img_prop:
+                        for _f in range(f + 1, video_length, subvideo_length_img_prop):
+                            s_f = max(0, _f - pad_len)
+                            e_f = min(video_length, _f + subvideo_length_img_prop + pad_len)
+                            pad_len_s = max(0, _f) - s_f
+                            pad_len_e = e_f - min(video_length, _f + subvideo_length_img_prop)
+                            pred_flows_bi_sub = (pred_flows_bi[0][:, s_f:e_f-1], pred_flows_bi[1][:, s_f:e_f-1])
+                            to_prop_frame_tensor = torch.stack(to_inpaint_frames[s_f:e_f], dim=1).to(device)
+                            to_prop_mask_tensor = torch.stack(to_inpaint_masks[s_f:e_f], dim=1).to(device)
+                            prop_imgs_sub, updated_local_masks_sub = model.img_propagation(to_prop_frame_tensor, 
+                                                                            pred_flows_bi_sub, 
+                                                                            to_prop_mask_tensor, 
+                                                                            'nearest')
+                            updated_frames_sub = prop_imgs_sub.view(b, -1, 3, h, w) * to_prop_mask_tensor + to_prop_frame_tensor * (1 - to_prop_mask_tensor)
+                            updated_masks_sub = updated_local_masks_sub.view(b, -1, 1, h, w)
+                            to_inpaint_frames[_f:e_f-pad_len_e] = updated_frames_sub[:, pad_len_s:e_f-s_f-pad_len_e].unbind(dim=1)
+                            to_inpaint_masks[_f:e_f-pad_len_e] = updated_masks_sub[:, pad_len_s:e_f-s_f-pad_len_e].unbind(dim=1)
+                            torch.cuda.empty_cache()
+                    else:
+                        pred_flows_bi_sub = (pred_flows_bi[0][:, f+1:], pred_flows_bi[1][:, f+1:])
+                        to_prop_frame_tensor = torch.stack(to_inpaint_frames[f+1:], dim=1).to(device)
+                        to_prop_mask_tensor = torch.stack(to_inpaint_masks[f+1:], dim=1).to(device)
                         prop_imgs_sub, updated_local_masks_sub = model.img_propagation(to_prop_frame_tensor, 
-                                                                        pred_flows_bi_sub, 
-                                                                        to_prop_mask_tensor, 
-                                                                        'nearest')
+                                                                            pred_flows_bi_sub, 
+                                                                            to_prop_mask_tensor, 
+                                                                            'nearest')
                         updated_frames_sub = prop_imgs_sub.view(b, -1, 3, h, w) * to_prop_mask_tensor + to_prop_frame_tensor * (1 - to_prop_mask_tensor)
                         updated_masks_sub = updated_local_masks_sub.view(b, -1, 1, h, w)
-                        to_inpaint_frames[_f:e_f-pad_len_e] = updated_frames_sub[:, pad_len_s:e_f-s_f-pad_len_e].unbind(dim=1)
-                        to_inpaint_masks[_f:e_f-pad_len_e] = updated_masks_sub[:, pad_len_s:e_f-s_f-pad_len_e].unbind(dim=1)
+                        to_inpaint_frames[f+1:] = updated_frames_sub.unbind(dim=1)
+                        to_inpaint_masks[f+1:] = updated_masks_sub.unbind(dim=1)
                         torch.cuda.empty_cache()
                 pbar.update(1)
             inpainted_frames = torch.stack(to_inpaint_frames, dim=1).squeeze(0).cpu().permute(0, 2, 3, 1).numpy()
@@ -446,7 +470,7 @@ if __name__ == '__main__':
     parser.add_argument(
         "--raft_iter", type=int, default=20, help='Iterations for RAFT inference.')
     parser.add_argument(
-        '--mode', default='video_inpainting', choices=['video_inpainting', 'video_inpainting_vipdiff', 'video_propagation', 'video_outpainting'], help="Modes: video_inpainting / video_inpainting_vipdiff / video_propagation / video_outpainting")
+        '--mode', default='video_inpainting', choices=['video_inpainting', 'video_inpainting_lama', 'video_inpainting_vipdiff', 'video_propagation', 'video_outpainting'], help="Modes: video_inpainting / video_inpainting_lama / video_inpainting_vipdiff / video_propagation / video_outpainting")
     parser.add_argument(
         '--scale_h', type=float, default=1.0, help='Outpainting scale of height for video_outpainting mode.')
     parser.add_argument(
@@ -478,7 +502,7 @@ if __name__ == '__main__':
     if not os.path.exists(save_root):
         os.makedirs(save_root, exist_ok=True)
 
-    if args.mode == 'video_inpainting' or args.mode == 'video_inpainting_vipdiff' or args.mode == 'video_propagation':
+    if args.mode == 'video_inpainting' or args.mode == 'video_inpainting_lama' or args.mode == 'video_inpainting_vipdiff' or args.mode == 'video_propagation':
         frames_len = len(frames)
         flow_masks, masks_dilated = read_mask(args.mask, frames_len, size, 
                                               flow_mask_dilates=args.mask_dilation,
@@ -559,6 +583,7 @@ if __name__ == '__main__':
     ##############################################
     comp_frames = None
     cuts = video_cutter(frames)
+    print(f"Video cuts: {len(cuts)}")
     if len(cuts) == 0:
         comp_frames = inference(frames, flow_masks, masks_dilated, fix_flow_complete, model, vipdiff_pipe, size, device)
     else:
@@ -566,7 +591,7 @@ if __name__ == '__main__':
         cuts.append(video_length)
         for cut in cuts:
             comp_frames_sub = inference(frames[:,start:cut], flow_masks[:,start:cut], masks_dilated[:,start:cut], 
-                                        fix_flow_complete[:,start:cut], model, vipdiff_pipe, size, device)
+                                        fix_flow_complete, model, vipdiff_pipe, size, device)
             comp_frames = comp_frames_sub if comp_frames is None else np.concatenate((comp_frames, comp_frames_sub), axis=0)
             start = cut
 
